@@ -1,0 +1,13 @@
+torch
+torchvision
+torchaudio
+numpy
+scipy
+einops
+timm
+opencv-python
+pillow
+nuscenes-devkit
+wandb
+tensorboard
+open3d
