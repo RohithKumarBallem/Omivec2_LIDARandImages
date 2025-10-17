@@ -1,40 +1,33 @@
-import os, yaml, torch, cv2
-import numpy as np
-from src.data.nuscenes_loader import NuScenesMiniSample
-from src.models.tokenizers import ImagePatchTokenizer, LidarPillarTokenizer
-from src.models.omnivec2_core import OmniVec2Tiny
-from src.utils.device import get_device
+import os  # [attached_file:1]
+import torch  # [attached_file:1]
+from src.models.tokenizers import ImagePatchTokenizer, PointTokenTokenizer  # [attached_file:1]
+from src.models.omnivec2_core import OmniVec2Tiny  # [attached_file:1]
+from src.data.nuscenes_loader import NuScenesMiniSample  # assumes your existing loader [attached_file:1]
 
-# Free MPS cache if available
-if hasattr(torch.mps, "empty_cache"):
-    torch.mps.empty_cache()
+def main():
+    dev = "mps" if torch.backends.mps.is_available() else "cpu"  # [attached_file:1]
+    device = torch.device(dev)  # [attached_file:1]
 
-cfg = yaml.safe_load(open("config/dataset.yaml"))
-root = cfg["nuscenes"]["dataroot"]
-ver = cfg["nuscenes"]["version"]
-cams = cfg["nuscenes"]["cameras"]
-lidar = cfg["nuscenes"]["lidar"]
-H, W = cfg["nuscenes"]["image_size"]
+    # Minimal sample fetch (adapt to your loader API)
+    ds = NuScenesMiniSample(...)  # fill with your existing params [attached_file:1]
+    token, imgs_dict, points = ds.get_first_sample()  # [attached_file:1]
 
-ds = NuScenesMiniSample(root, ver, cams, lidar)
-tok, imgs, pts = ds.get_first_sample()
+    # Preprocess to tensors
+    imgs = torch.stack([torch.from_numpy(imgs_dict[k]).permute(2,0,1) for k in sorted(imgs_dict.keys())], dim=0).float() / 255.0  # [attached_file:1]
+    # Just use the first camera for demo
+    img = imgs[0:1].to(device)  # [1, 3, H, W] [attached_file:1]
+    pts = torch.from_numpy(points).unsqueeze(0).to(device).float()  # [1, N, C] [attached_file:1]
 
-# Use 1–3 cameras to reduce tokens; start with 1 for MPS
-sel = ["CAM_FRONT"]
-ims = [cv2.resize(imgs[c], (W, H)) for c in sel]
-im = np.concatenate(ims, axis=0)  # [H, W, 3] if one cam
-if len(sel) > 1:
-    im = np.concatenate(ims, axis=0)  # [kH, W, 3]
-im = torch.from_numpy(im).permute(2,0,1).unsqueeze(0).float() / 255.0  # [1,3,H*,W]
+    img_tok = ImagePatchTokenizer(embed_dim=96, patch=32).to(device)  # [attached_file:1]
+    lid_tok = PointTokenTokenizer(in_ch=4, embed_dim=96, num_tokens=1024).to(device)  # [attached_file:1]
+    backbone = OmniVec2Tiny(dim=96, heads=3, ff=192, depth=1).to(device)  # [attached_file:1]
 
-pc = torch.from_numpy(pts).unsqueeze(0).float()  # [1,N,4]
+    with torch.no_grad():
+        ti = img_tok(img)      # [1, N_img, 96] [attached_file:1]
+        tl = lid_tok(pts)      # [1, 1024, 96] [attached_file:1]
+        z = backbone(ti, tl)   # [1, 96] [attached_file:1]
 
-dev = get_device()
-im, pc = im.to(dev), pc.to(dev)
+    print("Image tokens:", ti.shape, "LiDAR tokens:", tl.shape, "Fused:", z.shape)  # [attached_file:1]
 
-img_tok = ImagePatchTokenizer(embed_dim=96, patch=32).to(dev)(im)
-lid_tok = LidarPillarTokenizer(cell=1.0, embed_dim=96).to(dev)(pc)
-
-model = OmniVec2Tiny(dim=96, heads=3, ff=192, depth=1).to(dev)
-out = model(img_tok, lid_tok)
-print("Fused embedding:", out.shape)
+if __name__ == "__main__":
+    main()  # [attached_file:1]
