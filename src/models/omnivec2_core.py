@@ -21,13 +21,73 @@ class CrossModalBlock(nn.Module):
         return img_tok, lidar_tok  # [attached_file:1]
 
 class OmniVec2Tiny(nn.Module):
-    def __init__(self, dim=96, heads=3, ff=192, depth=1):
+    """
+    Shared multimodal Transformer encoder.
+    - Inputs: image_tokens [B, T_img, D], lidar_tokens [B, T_lid, D]
+    - Adds learned modality/type embeddings to each span
+    - Runs TransformerEncoder over concatenated sequence
+    - Returns fused token sequence [B, T_img+T_lid, D]
+    """
+    def __init__(self, dim=96, heads=3, ff=192, depth=1, dropout=0.0):
         super().__init__()
-        self.blocks = nn.ModuleList([CrossModalBlock(dim, heads, ff) for _ in range(depth)])  # [attached_file:1]
-        self.head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim))  # [attached_file:1]
+        self.dim = dim
+        self.type_embed = nn.Parameter(torch.randn(2, dim) * 0.02)  # [2,D] for (img, lidar)
 
-    def forward(self, img_tok, lidar_tok):
-        for blk in self.blocks:
-            img_tok, lidar_tok = blk(img_tok, lidar_tok)  # [attached_file:1]
-        fused = 0.5 * (img_tok.mean(dim=1) + lidar_tok.mean(dim=1))  # [B, D]  # [attached_file:1]
-        return self.head(fused)  # [B, D]  # [attached_file:1]
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=heads,
+            dim_feedforward=ff,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.out_norm = nn.LayerNorm(dim)
+
+        # Optional positional encoding (sinusoidal)
+        self.use_pos = True
+        self.pos_cache = {}
+
+    def _sinusoidal_pos(self, B, T, D, device):
+        key = (T, D, device)
+        if key in self.pos_cache:
+            return self.pos_cache[key]
+        pos = torch.arange(T, device=device).unsqueeze(1)  # [T,1]
+        i = torch.arange(D, device=device).unsqueeze(0)    # [1,D]
+        div = torch.exp(-torch.arange(0, D, 2, device=device) * (torch.log(torch.tensor(10000.0, device=device)) / D))
+        pe = torch.zeros(T, D, device=device)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        pe = pe.unsqueeze(0).expand(B, T, D)               # [B,T,D]
+        self.pos_cache[key] = pe
+        return pe
+
+    def forward(self, img_tok: torch.Tensor, lid_tok: torch.Tensor):
+        """
+        img_tok: [B, T_img, D]
+        lid_tok: [B, T_lid, D]
+        returns: fused [B, T_img+T_lid, D]
+        """
+        B, T_img, D = img_tok.shape
+        _, T_lid, D2 = lid_tok.shape
+        assert D == self.dim and D2 == self.dim, "Token dims must match model dim"
+
+        # Add modality/type embeddings
+        img_add = self.type_embed[0].unsqueeze(0).unsqueeze(1).expand(B, T_img, D)
+        lid_add = self.type_embed[1].unsqueeze(0).unsqueeze(1).expand(B, T_lid, D)
+        img = img_tok + img_add
+        lid = lid_tok + lid_add
+
+        # Concatenate
+        seq = torch.cat([img, lid], dim=1)                 # [B, T_img+T_lid, D]
+
+        # Positional encoding
+        if self.use_pos:
+            pos = self._sinusoidal_pos(B, seq.size(1), D, seq.device)
+            seq = seq + pos
+
+        # Transformer encoder
+        fused = self.encoder(seq)                           # [B, T_img+T_lid, D]
+        fused = self.out_norm(fused)
+        return fused
