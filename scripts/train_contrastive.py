@@ -1,145 +1,205 @@
-# scripts/train_contrastive.py
-import os, yaml, random, cv2, torch
-import numpy as np
+#!/usr/bin/env python3
+"""
+Hybrid contrastive training: CrossModalBlock + OmniVec2Tiny.
+
+Pipeline:
+1. Tokenize → [B, 84, 96], [B, 512, 96]
+2. CrossModalBlock (explicit cross-attention) → [B, 84, 96], [B, 512, 96]
+3. OmniVec2Tiny (shared self-attention fusion) → [B, 596, 96]
+4. Pool → [B, 96]
+5. Project → [B, 128] for each modality
+6. InfoNCE loss
+"""
+
+import os
+import yaml
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.data_classes import LidarPointCloud
 
-from src.utils.device import get_device
 from src.models.tokenizers import ImagePatchTokenizer, PointTokenTokenizer
-from src.models.omnivec2_core import OmniVec2Tiny
-from src.utils.training import info_nce_loss  # signature: info_nce_loss(z_img, z_lid, tau)
+from src.models.omnivec2_core import CrossModalBlock, OmniVec2Tiny
+from src.data.nuscenes_loader import NuScenesMiniIter
 
-def load_sample(nusc, cams, lidar, H, W, token):
-    sample = nusc.get("sample", token)
-    sd = nusc.get("sample_data", sample["data"][cams[0]])
-    img = cv2.imread(os.path.join(nusc.dataroot, sd["filename"]))
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (W, H))
-    sd_l = nusc.get("sample_data", sample["data"][lidar])
-    pc = LidarPointCloud.from_file(os.path.join(nusc.dataroot, sd_l["filename"]))
-    pts = pc.points.T.astype(np.float32)  # [N,4] XYZI
 
-    im = torch.from_numpy(img).permute(2,0,1).unsqueeze(0).float() / 255.0  # [1,3,H,W]
-    pts = torch.from_numpy(pts).unsqueeze(0).float()  # [1,N,4]
-    return im, pts
+class ProjectionHead(nn.Module):
+    """MLP projection head for contrastive learning."""
+    def __init__(self, in_dim=96, out_dim=128, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, out_dim),
+        )
+    
+    def forward(self, x):
+        return self.net(x)
 
-def collect_tokens(nusc):
-    tokens = []
-    for sc in nusc.scene:
-        t = sc["first_sample_token"]
-        while t:
-            tokens.append(t)
-            samp = nusc.get("sample", t)
-            t = samp["next"]
-    return tokens
 
-def pad_points_batch(clouds, K=None, device="cpu"):
+def info_nce_loss(z_i, z_l, tau=0.1):
     """
-    clouds: list of [N_i,4] float tensors (CPU)  -> returns [B, maxN or K, 4] float on device.
-    If K is provided, randomly samples or repeats to K per sample. Otherwise pads to maxN.
+    Symmetric InfoNCE loss.
+    z_i, z_l: [B, D] normalized embeddings
     """
-    B = len(clouds)
-    if K is not None:
-        out = []
-        for pc in clouds:
-            N = pc.shape[0]
-            if N >= K:
-                idx = torch.randint(0, N, (K,))
-                out.append(pc[idx])
-            else:
-                reps = (K + N - 1) // N
-                out.append(pc.repeat(reps, 1)[:K])
-        return torch.stack(out, dim=0).to(device)
-    else:
-        maxN = max(pc.shape[0] for pc in clouds)
-        pts = torch.zeros(B, maxN, 4, dtype=torch.float32)
-        for i, pc in enumerate(clouds):
-            pts[i, :pc.shape[0]] = pc
-        return pts.to(device)
+    B = z_i.size(0)
+    
+    # Normalize
+    z_i = F.normalize(z_i, dim=1)
+    z_l = F.normalize(z_l, dim=1)
+    
+    # Similarity matrix [B, B]
+    sim = (z_i @ z_l.T) / tau
+    
+    # Positive pairs are on diagonal
+    labels = torch.arange(B, device=z_i.device)
+    
+    # Cross-entropy loss both directions
+    loss_i2l = F.cross_entropy(sim, labels)
+    loss_l2i = F.cross_entropy(sim.T, labels)
+    
+    return (loss_i2l + loss_l2i) / 2
+
 
 def main():
-    cfg = yaml.safe_load(open("config/dataset.yaml"))
-    root = cfg["nuscenes"]["dataroot"]
-    ver  = cfg["nuscenes"]["version"]
-    cams = cfg["nuscenes"]["cameras"]
-    lidar = cfg["nuscenes"]["lidar"]
-    H, W = cfg["nuscenes"]["image_size"]
-
-    nusc = NuScenes(version=ver, dataroot=root, verbose=False)
-    tokens = collect_tokens(nusc)
-
-    dev = get_device()
-    img_tok = ImagePatchTokenizer(embed_dim=96, patch=32).to(dev)
-    lid_tok = PointTokenTokenizer(in_ch=4, embed_dim=96, num_tokens=512, mlp_hidden=256).to(dev)
-    backbone = OmniVec2Tiny(dim=96, heads=3, ff=192, depth=1).to(dev)  # shared Transformer
-
-    opt = torch.optim.AdamW(
-        list(img_tok.parameters()) + list(lid_tok.parameters()) + list(backbone.parameters()),
-        lr=3e-4, weight_decay=1e-4
+    # Device
+    dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = torch.device(dev)
+    print(f"Using device: {device}")
+    
+    # Load config
+    cfg_path = os.path.join("config", "dataset.yaml")
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    
+    nus_cfg = cfg.get("nuscenes", {})
+    root = nus_cfg.get("dataroot")
+    img_size_cfg = nus_cfg.get("image_size", [224, 384])
+    H, W = img_size_cfg[-2], img_size_cfg[-1]
+    
+    print(f"Dataroot: {root}")
+    print(f"Image size: H={H}, W={W}")
+    
+    # Model components
+    embed_dim = 96
+    proj_dim = 128
+    
+    # Tokenizers
+    img_tok = ImagePatchTokenizer(embed_dim=embed_dim, patch=32).to(device)
+    lid_tok = PointTokenTokenizer(in_ch=4, embed_dim=embed_dim, num_tokens=512).to(device)
+    
+    # Stage 1: CrossModalBlock (explicit cross-attention)
+    cross_modal = CrossModalBlock(dim=embed_dim, heads=3, ff=192).to(device)
+    
+    # Stage 2: OmniVec2Tiny (shared self-attention fusion)
+    backbone = OmniVec2Tiny(dim=embed_dim, heads=3, ff=192, depth=1).to(device)
+    
+    # Projection heads (separate for image and lidar branches)
+    proj_i = ProjectionHead(in_dim=embed_dim, out_dim=proj_dim).to(device)
+    proj_l = ProjectionHead(in_dim=embed_dim, out_dim=proj_dim).to(device)
+    
+    # Optimizer (all parameters)
+    params = (
+        list(img_tok.parameters()) + 
+        list(lid_tok.parameters()) + 
+        list(cross_modal.parameters()) + 
+        list(backbone.parameters()) +
+        list(proj_i.parameters()) + 
+        list(proj_l.parameters())
     )
-
-    steps = min(50, len(tokens))
-    B = 4
-    assert B >= 2, "Batch size must be >= 2 for InfoNCE"
-
-    for step in range(steps):
-        ims, clouds = [], []
-        for _ in range(B):
-            t = tokens[random.randrange(len(tokens))]
-            im1, pts1 = load_sample(nusc, cams, lidar, H, W, t)
-            ims.append(im1)
-            clouds.append(pts1.squeeze(0))
-
-        im = torch.cat(ims, dim=0).to(dev)                  # [B,3,H,W]
-        pts = pad_points_batch(clouds, K=None, device=dev)  # [B,maxN,4] or [B,K,4]
-
-        # Tokenize
-        t_img = img_tok(im)                                  # [B, T_img, 96]
-        t_lid = lid_tok(pts)                                 # [B, 512,    96]
-        T_img = t_img.size(1)
-
-        # Shared Transformer fusion: expect backbone to accept (img_tokens, lidar_tokens)
-        fused = backbone(t_img, t_lid)                       # either [B,96] or [B, T_img+512, 96]
-        if fused.ndim == 2:
-            # If backbone outputs pooled embedding, also create per-modality fused emb via residual path
-            # Fallback: use pre-fusion pools but this reduces fusion effect; better make backbone return sequence.
-            zi_fused = t_img.mean(dim=1)                    # [B,96]
-            zl_fused = t_lid.mean(dim=1)                    # [B,96]
-            z_scene = fused                                 # [B,96] for logging
-        else:
-            # Slice fused tokens into image and LiDAR spans, then pool each span
-            fused_img = fused[:, :T_img, :]                 # [B, T_img, 96]
-            fused_lid = fused[:, T_img:, :]                 # [B, 512,   96]
-            zi_fused = fused_img.mean(dim=1)                # [B,96]
-            zl_fused = fused_lid.mean(dim=1)                # [B,96]
-            z_scene = fused.mean(dim=1)                     # [B,96] optional scene summary
-
-        # Normalize and compute InfoNCE on fused modality pools
-        zi = F.normalize(zi_fused, dim=-1)
-        zl = F.normalize(zl_fused, dim=-1)
-        loss = info_nce_loss(zi, zl, tau=0.5)
-
-        opt.zero_grad(set_to_none=True)
+    optimizer = torch.optim.AdamW(params, lr=3e-4, weight_decay=0.01)
+    
+    # Data loader
+    ds = NuScenesMiniIter(
+        root=root,
+        batch_size=4,
+        steps=200,
+        img_size=(H, W),
+        shuffle=True,
+    )
+    
+    # Training loop
+    max_iters = 100
+    print(f"\nTraining for {max_iters} iterations with hybrid architecture...")
+    print("  Stage 1: CrossModalBlock (cross-attention)")
+    print("  Stage 2: OmniVec2Tiny (self-attention fusion)\n")
+    
+    cross_modal.train()
+    backbone.train()
+    step = 0
+    
+    for imgs, pts in ds:
+        if step >= max_iters:
+            break
+        
+        imgs = imgs.float().to(device) / 255.0
+        pts = pts.float().to(device)
+        
+        # 1. Tokenize
+        ti = img_tok(imgs)      # [B, 84, 96]
+        tl = lid_tok(pts)       # [B, 512, 96]
+        
+        # 2. Stage 1: Cross-modal interaction (explicit cross-attention)
+        ti_cross, tl_cross = cross_modal(ti, tl)  # [B, 84, 96], [B, 512, 96]
+        
+        # 3. Stage 2: Deep fusion (shared self-attention)
+        fused = backbone(ti_cross, tl_cross)  # [B, 596, 96]  (84+512 tokens)
+        
+        # 4. Split back into modality-specific token groups
+        T_img = ti.shape[1]  # 84
+        ti_fused = fused[:, :T_img, :]      # [B, 84, 96]  (image tokens)
+        tl_fused = fused[:, T_img:, :]      # [B, 512, 96] (lidar tokens)
+        
+        # 5. Pool each modality separately
+        z_i = ti_fused.mean(dim=1)  # [B, 96]
+        z_l = tl_fused.mean(dim=1)  # [B, 96]
+        
+        # 6. Project to contrastive space
+        z_i_proj = proj_i(z_i)  # [B, 128]
+        z_l_proj = proj_l(z_l)  # [B, 128]
+        
+        # 7. Compute InfoNCE loss
+        loss = info_nce_loss(z_i_proj, z_l_proj, tau=0.1)
+        
+        # Backprop
+        optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(list(img_tok.parameters()) + list(lid_tok.parameters()) + list(backbone.parameters()), 1.0)
-        opt.step()
-
+        optimizer.step()
+        
+        # Logging
         if (step + 1) % 5 == 0:
             with torch.no_grad():
-                sims = zi @ zl.t()
-                sim_pos = sims.diag().mean().item()
-                zi_std = zi.std(dim=-1).mean().item()
-                zl_std = zl.std(dim=-1).mean().item()
-            print(f"step {step+1}/{steps} loss {loss.item():.4f} scene_norm={z_scene.norm(dim=-1).mean().item():.2f} sim+={sim_pos:.3f} zi_std={zi_std:.3f} zl_std={zl_std:.3f}")
-
+                z_i_norm = F.normalize(z_i_proj, dim=1)
+                z_l_norm = F.normalize(z_l_proj, dim=1)
+                
+                # Diagonal similarity (positives)
+                sim_pos = (z_i_norm * z_l_norm).sum(dim=1).mean()
+                
+                # Embedding stats
+                zi_std = z_i_proj.std(dim=0).mean()
+                zl_std = z_l_proj.std(dim=0).mean()
+                z_i_mag = z_i.norm(dim=1).mean()
+                
+                print(f"step {step+1}/{max_iters} loss {loss.item():.4f} "
+                      f"sim+={sim_pos.item():.3f} zi_std={zi_std.item():.3f} "
+                      f"zl_std={zl_std.item():.3f} z_mag={z_i_mag.item():.2f}")
+        
+        step += 1
+    
+    # Save checkpoint
     os.makedirs("checkpoints", exist_ok=True)
+    ckpt_path = "checkpoints/omnivec2_hybrid_96D.pt"
     torch.save({
-        "img_tok": img_tok.state_dict(),
-        "lid_tok": lid_tok.state_dict(),
-        "backbone": backbone.state_dict(),
-    }, "checkpoints/omnivec2_fused_contrastive_96D.pt")
-    print("Saved checkpoint to checkpoints/omnivec2_fused_contrastive_96D.pt")
+        'img_tok': img_tok.state_dict(),
+        'lid_tok': lid_tok.state_dict(),
+        'cross_modal': cross_modal.state_dict(),
+        'backbone': backbone.state_dict(),
+        'proj_i': proj_i.state_dict(),
+        'proj_l': proj_l.state_dict(),
+    }, ckpt_path)
+    
+    print(f"\nCheckpoint saved to {ckpt_path}")
+    print("Training complete!")
+
 
 if __name__ == "__main__":
     main()
